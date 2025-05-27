@@ -154,12 +154,14 @@ class TexasHoldem:
         self.big_blind = 10
         self.last_action = None
         self.action_messages = []
+        self.round_complete = False
     
     def start_new_hand(self):
         self.deck.reset()
         self.community_cards = []
         self.pot = 0
         self.current_bet = 0
+        self.round_complete = False
         
         # Clear all player hands
         for player in self.players:
@@ -178,6 +180,7 @@ class TexasHoldem:
         
         self.current_player_index = 2 % len(self.players)
         self.game_state = "preflop"
+        self.last_action = None
     
     def deal_flop(self):
         # Burn card
@@ -188,6 +191,7 @@ class TexasHoldem:
         self.game_state = "flop"
         self.current_player_index = 0
         self.current_bet = 0
+        self.round_complete = False
         for player in self.players:
             player.current_bet = 0
         # Reset last action when moving to a new betting round
@@ -201,6 +205,7 @@ class TexasHoldem:
         self.game_state = "turn"
         self.current_player_index = 0
         self.current_bet = 0
+        self.round_complete = False
         for player in self.players:
             player.current_bet = 0
         # Reset last action when moving to a new betting round
@@ -214,17 +219,37 @@ class TexasHoldem:
         self.game_state = "river"
         self.current_player_index = 0
         self.current_bet = 0
+        self.round_complete = False
         for player in self.players:
             player.current_bet = 0
         # Reset last action when moving to a new betting round
         self.last_action = None
     
     def next_player(self):
+        # Store the starting player index to check if we've gone around the table
+        start_index = self.current_player_index
+        
         # Move to next player
         self.current_player_index = (self.current_player_index + 1) % len(self.players)
+        
         # Skip folded players
         while self.players[self.current_player_index].is_folded:
             self.current_player_index = (self.current_player_index + 1) % len(self.players)
+            # If all players are folded except one, we're done
+            if all(p.is_folded for p in self.players if p != self.players[self.current_player_index]):
+                self.round_complete = True
+                return
+        
+        # Check if we've gone around the table back to the first player who acted in this round
+        # or if we've reached the player after the last raiser
+        active_players = [p for p in self.players if not p.is_folded]
+        if len(active_players) <= 1:
+            self.round_complete = True
+        elif all(p.current_bet == self.current_bet for p in active_players):
+            # If everyone has matched the current bet, mark the round as complete
+            # This is needed for the case where everyone checks
+            if self.current_player_index == 0:  # Back to the first player
+                self.round_complete = True
     
     def check_round_end(self):
         # Check if all players have bet or folded
@@ -235,9 +260,11 @@ class TexasHoldem:
             self.game_state = "waiting"
             return True
         
-        # Check if all bets are equal
+        # Check if all active players have made equal bets and the round is complete
         bet_amounts = [p.current_bet for p in active_players]
-        if len(set(bet_amounts)) == 1 and self.current_player_index == 0:
+        
+        # All players have had a chance to act and all bets are equal
+        if len(set(bet_amounts)) == 1 and self.round_complete:
             # Move to next stage
             if self.game_state == "preflop":
                 self.deal_flop()
@@ -250,6 +277,18 @@ class TexasHoldem:
                 # Simple win determination (actual poker hand evaluation is complex)
                 winner = random.choice(active_players)
                 winner.chips += self.pot
+                
+                # Display winner message
+                font = pygame.font.SysFont(None, 36)
+                winner_text = f"{winner.name} wins {self.pot} chips!"
+                winner_surface = font.render(winner_text, True, WHITE)
+                winner_rect = winner_surface.get_rect(center=(WIDTH//2, HEIGHT//2))
+                screen.blit(winner_surface, winner_rect)
+                pygame.display.flip()
+                pygame.time.delay(3000)  # Show winner for 3 seconds
+            
+            # Reset round_complete flag
+            self.round_complete = False
             return True
         return False
     
@@ -258,20 +297,34 @@ class TexasHoldem:
         
         if action == "fold":
             player.fold()
+            # Check if only one player remains
+            active_players = [p for p in self.players if not p.is_folded]
+            if len(active_players) == 1:
+                self.round_complete = True
         elif action == "check":
             if player.current_bet < self.current_bet:
                 return False  # Can't check
+            # チェックはベットがない状態で「パス」するだけなので、ラウンド完了の判定は次のプレイヤーに移動するときに行う
         elif action == "call":
             call_amount = self.current_bet - player.current_bet
             if call_amount > 0:
                 bet_amount = player.bet(call_amount)
                 self.pot += bet_amount
+                
+                # レイズに対するコールの場合、全員がコールしたかチェック
+                active_players = [p for p in self.players if not p.is_folded]
+                if all(p.current_bet == self.current_bet for p in active_players):
+                    # 最後のプレイヤーがコールした場合、またはすべてのアクティブプレイヤーがコールした場合
+                    # 最後のレイズをしたプレイヤーの次のプレイヤーまで一周した場合
+                    self.round_complete = True
         elif action == "raise":
             if amount > self.current_bet:
                 raise_amount = amount - player.current_bet
                 bet_amount = player.bet(raise_amount)
                 self.pot += bet_amount
                 self.current_bet = player.current_bet
+                # After a raise, reset round completion status and mark this player as the last raiser
+                self.round_complete = False
             else:
                 return False  # Invalid raise amount
         
@@ -493,26 +546,39 @@ while running:
         
         # Player's turn - show action buttons
         if game.current_player_index == 0 and game.game_state != "showdown":
+            # Check if this is the first action in a new betting round
+            is_first_action = game.last_action is None
+            
+            # Available actions depend on game state and position
             fold_button.check_hover(mouse_pos)
-            check_button.check_hover(mouse_pos)
-            call_button.check_hover(mouse_pos)
+            
+            # Only show check if no bet has been made or it's the first action after flop/turn/river
+            if game.players[0].current_bet == game.current_bet:
+                check_button.check_hover(mouse_pos)
+                check_button.draw()
+            else:
+                call_button.check_hover(mouse_pos)
+                call_button.draw()
+            
             raise_button.check_hover(mouse_pos)
             
             fold_button.draw()
-            check_button.draw()
-            call_button.draw()
             raise_button.draw()
             
             # Button descriptions
             font = pygame.font.SysFont(None, 18)
             fold_text = font.render("Discard your hand", True, WHITE)
-            check_text = font.render("Pass without betting", True, WHITE)
-            call_text = font.render("Match current bet", True, WHITE)
             raise_text = font.render("Increase bet", True, WHITE)
             
             screen.blit(fold_text, (fold_button.rect.x, fold_button.rect.y + fold_button.rect.height + 5))
-            screen.blit(check_text, (check_button.rect.x, check_button.rect.y + check_button.rect.height + 5))
-            screen.blit(call_text, (call_button.rect.x, call_button.rect.y + call_button.rect.height + 5))
+            
+            if game.players[0].current_bet == game.current_bet:
+                check_text = font.render("Pass without betting", True, WHITE)
+                screen.blit(check_text, (check_button.rect.x, check_button.rect.y + check_button.rect.height + 5))
+            else:
+                call_text = font.render("Match current bet", True, WHITE)
+                screen.blit(call_text, (call_button.rect.x, call_button.rect.y + call_button.rect.height + 5))
+                
             screen.blit(raise_text, (raise_button.rect.x, raise_button.rect.y + raise_button.rect.height + 5))
             
             # Draw raise slider
@@ -573,15 +639,8 @@ while running:
             # Simple AI: random action with weighted probabilities
             current_player = game.players[game.current_player_index]
             
-            # Check if this is the first action in a new betting round
-            is_first_action = game.last_action is None
-            
             # Available actions depend on game state and position
-            if is_first_action and game.game_state in ["flop", "turn", "river"]:
-                # First action in a new round after flop must be check or bet
-                actions = ["check", "raise"]
-                weights = [0.7, 0.3]  # 70% check, 30% raise
-            elif current_player.current_bet == game.current_bet:
+            if current_player.current_bet == game.current_bet:
                 # Can check if no bet has been made
                 actions = ["fold", "check", "raise"]
                 weights = [0.1, 0.6, 0.3]  # 10% fold, 60% check, 30% raise
@@ -594,7 +653,13 @@ while running:
             
             # Display CPU action
             font = pygame.font.SysFont(None, 24)
-            action_text = f"{current_player.name} chooses to {action.upper()}"
+            
+            if action == "raise":
+                raise_amount = random.randint(game.current_bet + 10, game.current_bet + 50)
+                action_text = f"{current_player.name} chooses to {action.upper()} to {raise_amount}"
+            else:
+                action_text = f"{current_player.name} chooses to {action.upper()}"
+                
             action_surface = font.render(action_text, True, WHITE)
             action_rect = action_surface.get_rect(center=(WIDTH//2, 180))
             screen.blit(action_surface, action_rect)
@@ -609,7 +674,6 @@ while running:
             elif action == "call":
                 game.player_action("call")
             elif action == "raise":
-                raise_amount = random.randint(game.current_bet + 10, game.current_bet + 50)
                 game.player_action("raise", raise_amount)
     
     # Update display
